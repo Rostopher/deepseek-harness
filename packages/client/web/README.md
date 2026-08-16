@@ -10,6 +10,8 @@ The boot page uses plain DOM and local CSS, so client-bundle and plugin-activati
 
 The optional override parameter `seams` forwards the module system's `loadBundle` transport override (`BootSeams`) for environments where external `<script>` execution cannot reach the page context; ordinary browser callers omit it. A pre-injected page transport is the default ahead of it: when `globalThis.__DSH_TRANSPORT__` (the connection package's `ClientTransportHooks`) carries `loadBundle`, the module stage adopts it as the bundle transport and skips the immediate-tier HTTP prefetch — explicit `seams` still win.
 
+The shell owns pending-interaction alerts (`PendingInteractionNotifier.tsx`, wired in the app-shell assembly). When any listed session gains a blocking approval, plan review, or question (a rising edge of the list's `pendingInteraction` projection), the shell plays a short WebAudio chime and — while the tab is hidden — raises a browser system notification whose click focuses the window and opens that session. Browser autoplay and notification-permission policies require a prior user gesture, so both channels arm on the first pointerdown/keydown, including the one-time permission prompt while the browser still holds `default`.
+
 ## Model Experience
 
 None, as the entry shell boots the browser plugin tree; nothing here reaches a model request.
@@ -21,3 +23,5 @@ None; this package neither assembles nor sends a provider request.
 ## Known Limitations and Deferred Work
 
 - **The application waits for the full roster** — one failed entry keeps the framework-free boot page visible with a per-entry report; partial UI availability is not supported.
+- **Narrow-window shell behavior lacks an assembled walkthrough** — ui-layout implements the concession chain, but this package has no shell-level narrow-viewport acceptance case.
+- **Reconnect replays re-alert** — across a reconnect, a still-pending interaction leaves and re-enters the list snapshot, so the chime/notification fires again; request-level dedup would require exposing the request's stable key in the list projection.

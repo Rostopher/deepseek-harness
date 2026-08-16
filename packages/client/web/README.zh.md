@@ -10,6 +10,8 @@ Web 启动内核：`new AppWebEntry(el, seams?).run()` 分两个阶段挂载客�
 
 可选的覆盖参数 `seams` 会为外部 `<script>` 执行无法到达页面上下文的环境转发模块系统的 `loadBundle` 传输覆盖（`BootSeams`）；普通浏览器调用方省略此参数。预注入的页面传输是位于其前的默认值：当 `globalThis.__DSH_TRANSPORT__`（connection 包的 `ClientTransportHooks`）携带 `loadBundle` 时，模块阶段将其采纳为 bundle 传输并跳过 immediately 层级的 HTTP 预取——显式 `seams` 仍然优先。
 
+外壳拥有待处理交互提醒（`PendingInteractionNotifier.tsx`，在 app-shell 组装中接线）。任何列出的会话出现阻塞性的审批、计划确认或提问（列表 `pendingInteraction` 投影的上升沿）时，外壳会播放一段简短的 WebAudio 提示音，并在标签页隐藏时弹出浏览器系统通知；点击通知会聚焦窗口并打开该会话。浏览器的自动播放与通知权限策略要求先有用户手势，因此两条通道都在首次 pointerdown/keydown 时武装，浏览器仍为 `default` 时的一次性权限请求也在此时发出。
+
 ## 模型体验
 
 无。入口外壳负责启动浏览器插件树；这里没有任何内容进入模型请求。
@@ -21,3 +23,5 @@ Web 启动内核：`new AppWebEntry(el, seams?).run()` 分两个阶段挂载客�
 ## 已知限制与暂缓事项
 
 - **应用会等待完整名册**：只要一个 entry 失败，不依赖框架的启动页就会保留并逐项报告；不支持部分 UI 可用。
+- **窄窗口外壳行为缺少组装后演练**：ui-layout 已实现让步链，但该包没有外壳级窄视口验收用例。
+- **重连重放会重复提醒**：重连后，仍未解决的待处理交互会在列表快照中先消失再出现，提示音与系统通知因此再触发一次；请求级去重需要把请求的稳定键暴露到列表投影中。
