@@ -840,10 +840,16 @@ export function resolveRouteModels(request: RouteCatalogRequest): RouteCatalog {
       invalid(provider, `model "${entry.id}" needs an api; the installed catalog does not describe it, so set the`
         + ' route\'s api to the wire protocol its endpoint speaks')
     }
-    const baseUrl = request.baseURL ?? base?.baseUrl ?? providerBaseUrl
-    if (baseUrl === undefined) {
+    const declaredBaseUrl = request.baseURL ?? base?.baseUrl ?? providerBaseUrl
+    if (declaredBaseUrl === undefined) {
       invalid(provider, `model "${entry.id}" needs a baseURL; the installed catalog does not describe this route`)
     }
+    // Anthropic's SDK owns the version segment — it requests
+    // `{baseUrl}/v1/messages` itself — so a baseURL the user closed with `/v1`
+    // would reach the wire doubled (`/v1/v1/messages`). OpenAI's SDKs fold the
+    // segment into the base instead, which is why only the anthropic route
+    // strips it. A deployment path above the segment is kept.
+    const baseUrl = api === 'anthropic-messages' ? declaredBaseUrl.replace(/\/v1\/?$/, '') : declaredBaseUrl
     // Capacities fall back to the route's own defaults, so a model listing that
     // discloses nothing but ids still yields a serviceable route. The fallback
     // is a guess by construction, which is why it is a configurable route field

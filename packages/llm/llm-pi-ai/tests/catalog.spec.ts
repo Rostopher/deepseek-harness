@@ -555,6 +555,37 @@ describe('catalog routes with per-model configuration', () => {
     expect(server.paths).toEqual(['/v1/chat/completions'])
   })
 
+  it('strips a trailing version segment from an anthropic-messages route’s baseURL', () => {
+    // Anthropic's SDK appends /v1/messages itself, so a baseURL already
+    // carrying /v1 would reach the wire doubled (/v1/v1/messages). An OpenAI
+    // route keeps its segment: there the version is part of the base by
+    // convention.
+    const resolved = resolveProfiles({
+      'acme-claude': {
+        api: 'anthropic-messages',
+        baseURL: 'https://gateway.example/v1',
+        models: [{ id: 'k3' }],
+      },
+      'acme-claude-slash': {
+        api: 'anthropic-messages',
+        baseURL: 'https://gateway.example/v1/',
+        models: [{ id: 'k3' }],
+      },
+      'acme-openai': {
+        api: 'openai-completions',
+        baseURL: 'https://gateway.example/v1',
+        models: [{ id: 'm' }],
+      },
+    })
+
+    const [anthropic] = resolved.get('acme-claude')?.piProvider.getModels() ?? []
+    const [anthropicSlash] = resolved.get('acme-claude-slash')?.piProvider.getModels() ?? []
+    const [openai] = resolved.get('acme-openai')?.piProvider.getModels() ?? []
+    expect(anthropic?.baseUrl).toBe('https://gateway.example')
+    expect(anthropicSlash?.baseUrl).toBe('https://gateway.example')
+    expect(openai?.baseUrl).toBe('https://gateway.example/v1')
+  })
+
   it('keeps the catalog provider’s own auth when the route repoints its protocol', () => {
     // Which environment a provider reads is a property of the provider, not of
     // the wire format its models speak: naming an api must not cost a profile

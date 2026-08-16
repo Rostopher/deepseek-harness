@@ -28,19 +28,24 @@ interface ListingServer {
 /**
  * A stand-in provider that answers one scripted `GET /models`. `chunks` writes
  * without a declared length, which is how a real streamed reply arrives.
+ * `routes` answers specific paths differently — a gateway whose bare path
+ * serves its web console while `/v1/models` serves the listing — and an
+ * unlisted path gets the default behavior.
  */
 async function listingServer(behavior: {
   status?: number
   body?: string
   chunks?: string[]
   holdOpenMs?: number
+  routes?: Record<string, { status?: number; body?: string }>
 }): Promise<ListingServer> {
   const paths: string[] = []
   const headers: IncomingMessage['headers'][] = []
   const server = createServer((request: IncomingMessage, response: ServerResponse) => {
     paths.push(request.url ?? '')
     headers.push(request.headers)
-    if (behavior.chunks !== undefined) {
+    const route = behavior.routes?.[request.url ?? '']
+    if (route === undefined && behavior.chunks !== undefined) {
       // No declared length: the ceiling has to hold on what is read.
       response.writeHead(behavior.status ?? 200, { 'content-type': 'application/json' })
       for (const chunk of behavior.chunks) response.write(chunk)
@@ -50,8 +55,8 @@ async function listingServer(behavior: {
       setTimeout(() => { response.end() }, behavior.holdOpenMs)
       return
     }
-    const body = behavior.body ?? '{}'
-    response.writeHead(behavior.status ?? 200, {
+    const body = route?.body ?? behavior.body ?? '{}'
+    response.writeHead(route?.status ?? behavior.status ?? 200, {
       'content-type': 'application/json',
       'content-length': String(Buffer.byteLength(body)),
     })
@@ -135,6 +140,78 @@ describe('draft-provider model discovery', () => {
     await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/openai/v1/` })
 
     expect(server.paths).toEqual(['/openai/v1/models'])
+  })
+
+  it('asks /v1/models when the bare path answers the gateway console instead', async () => {
+    // A new-api-style gateway's bare path serves its web console's HTML with a
+    // 200, so the refusal only surfaces at parse time; the listing lives under
+    // /v1 and answers the retry.
+    const server = await listingServer({
+      routes: {
+        '/models': { body: '<!doctype html><title>console</title>' },
+        '/v1/models': { body: JSON.stringify({ data: [{ id: 'k3' }] }) },
+      },
+    })
+    const ctx = await harness()
+
+    const models = await ctx.llm.discoverModels('llm-pi-ai', { baseURL: server.url, apiKey: 'probe-key' })
+
+    expect(models).toEqual([{ id: 'k3' }])
+    expect(server.paths).toEqual(['/models', '/v1/models'])
+    expect(server.headers[1]?.authorization).toBe('Bearer probe-key')
+  })
+
+  it('probes a version-segment base as-is, never doubling the segment', async () => {
+    const server = await listingServer({ body: JSON.stringify({ data: [{ id: 'm' }] }) })
+    const ctx = await harness()
+
+    await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/v1` })
+
+    expect(server.paths).toEqual(['/v1/models'])
+  })
+
+  it('reads the listing for an anthropic-messages route too', async () => {
+    // The listing's shape is OpenAI's regardless of the chat protocol: a
+    // gateway speaking Anthropic for chat still exposes /v1/models.
+    const server = await listingServer({
+      routes: {
+        '/models': { status: 404, body: '{"error":"no such path"}' },
+        '/v1/models': { body: JSON.stringify({ data: [{ id: 'k3' }] }) },
+      },
+    })
+    const ctx = await harness()
+
+    const models = await ctx.llm.discoverModels('llm-pi-ai', { baseURL: server.url, api: 'anthropic-messages' })
+
+    expect(models).toEqual([{ id: 'k3' }])
+    expect(server.paths).toEqual(['/models', '/v1/models'])
+  })
+
+  it('reports the versioned path’s verdict when both candidates fail', async () => {
+    // The retried path's failure is the informative one: the bare path's HTML
+    // says nothing about why the listing cannot be read.
+    const server = await listingServer({
+      routes: {
+        '/models': { body: '<!doctype html>' },
+        '/v1/models': { status: 401, body: '{"error":"nope"}' },
+      },
+    })
+    const ctx = await harness()
+
+    await expect(ctx.llm.discoverModels('llm-pi-ai', { baseURL: server.url, apiKey: 'wrong' }))
+      .rejects.toThrow(/\/v1\/models answered 401; check the API key/)
+  })
+
+  it('does not retry the other path for a terminal failure', async () => {
+    // An oversized reply is the endpoint answering, just too big; the other
+    // path would download the same verdict again.
+    const oversized = `{"data":[{"id":"m","pad":"${'x'.repeat(4 * 1024 * 1024)}"}]}`
+    const server = await listingServer({ body: oversized })
+    const ctx = await harness()
+
+    await expect(ctx.llm.discoverModels('llm-pi-ai', { baseURL: server.url }))
+      .rejects.toThrow(/answered with more than 4194304 bytes/)
+    expect(server.paths).toEqual(['/models'])
   })
 
   it('offers no credential when the draft names none', async () => {
@@ -260,7 +337,34 @@ describe('draft-provider model discovery', () => {
       .rejects.toMatchObject({ code: 'DISCOVERY_FAILED' })
   })
 
-  it.each(['anthropic-messages', 'azure-openai-responses', 'openai-codex-responses', 'google-generative-ai'])(
+  it('still reports the refusal when cancelling the refused body fails', async () => {
+    // The cancel is best-effort cleanup before the next candidate is asked; a
+    // stuck body must not swallow the endpoint's actual verdict.
+    const ctx = await harness()
+    vi.stubGlobal('fetch', async () => {
+      const response = new Response('{"error":"boom"}', { status: 500 })
+      const body = response.body
+      if (body !== null) body.cancel = () => Promise.reject(new Error('stuck body'))
+      return response
+    })
+
+    await expect(ctx.llm.discoverModels('llm-pi-ai', { baseURL: 'https://acme.test/v1' }))
+      .rejects.toThrow(/answered 500/)
+  })
+
+  it('propagates a mid-body stream failure as the raw error it is', async () => {
+    // A connection dying during the body read is neither an abort nor a coded
+    // discovery verdict; the reader's own error is the honest report.
+    const ctx = await harness()
+    vi.stubGlobal('fetch', async () => new Response(new ReadableStream<Uint8Array>({
+      start(stream) { stream.error(new TypeError('socket reset mid-body')) },
+    })))
+
+    await expect(ctx.llm.discoverModels('llm-pi-ai', { baseURL: 'https://acme.test/v1' }))
+      .rejects.toThrow('socket reset mid-body')
+  })
+
+  it.each(['azure-openai-responses', 'openai-codex-responses', 'google-generative-ai'])(
     'says it cannot interrogate %s rather than guessing a shape',
     async (api) => {
       // Azure authenticates with an `api-key` header and an `api-version`

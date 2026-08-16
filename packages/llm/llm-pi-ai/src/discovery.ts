@@ -13,11 +13,14 @@
  * metadata the surface offers for adoption. `settings.yaml` remains the only
  * thing that decides what a route serves.
  *
- * Only OpenAI-compatible protocols are interrogated. Their listing is the one
- * shape a gateway, a self-hosted server, and the official endpoints all agree
- * on, which is the case this action exists for; every other protocol reports
- * that it cannot be interrogated so the surface falls back to hand-entry
- * rather than guessing a response shape.
+ * Only protocols whose listing is the OpenAI `GET /models` shape are
+ * interrogated — the one shape a gateway, a self-hosted server, and the
+ * official endpoints all agree on, which is the case this action exists for;
+ * every other protocol reports that it cannot be interrogated so the surface
+ * falls back to hand-entry rather than guessing a response shape. Where that
+ * listing lives depends on the convention the typed base follows: a bare host
+ * is asked at `/models` and then `/v1/models`, while a base already carrying
+ * the version segment is asked as-is.
  *
  * @module dsh-llm-pi-ai/discovery
  */
@@ -28,8 +31,13 @@ import { attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { catalogModels } from './catalog.ts'
 
 /**
- * Protocols whose model listing this module can read: the two that speak
- * OpenAI's `GET /models` shape with bearer auth. Azure is absent despite its
+ * Protocols whose model listing this module can read. The listing read here is
+ * OpenAI's `GET /models` shape with bearer auth — the one shape a gateway, a
+ * self-hosted server, and the official endpoints all agree on. That includes
+ * `anthropic-messages` routes: a gateway speaking Anthropic for chat still
+ * exposes the OpenAI-shaped listing (new-api/one-api do, and Anthropic's own
+ * endpoint lists at `/v1/models`), and the official Anthropic route is a
+ * catalog route that never reaches this probe. Azure is absent despite its
  * OpenAI lineage — it authenticates with an `api-key` header and requires an
  * `api-version` query — and Codex authenticates through OAuth; guessing at
  * either would report an authentication failure as a provider with no models.
@@ -38,6 +46,7 @@ import { catalogModels } from './catalog.ts'
 const LISTABLE_PROTOCOLS: ReadonlySet<string> = new Set([
   'openai-completions',
   'openai-responses',
+  'anthropic-messages',
 ])
 
 /**
@@ -78,13 +87,21 @@ function label(...candidates: readonly unknown[]): string | undefined {
 }
 
 /**
- * Join the endpoint base with the listing path. The base is treated as a
- * prefix rather than a URL to resolve against, so a deployment path such as
+ * Candidate listing URLs, most-likely first. Who owns the version segment is
+ * a convention the typed base may follow either way: OpenAI SDKs fold it into
+ * the base (`…/v1` + `/models`), Anthropic's SDK appends it (`…` +
+ * `/v1/messages`), and a gateway's bare host answers only under `/v1`. So a
+ * base without a version segment is tried bare first and then under `/v1`;
+ * one already carrying it (`…/v1`) is probed as-is only — appending another
+ * would double it (`/v1/v1/models`). The base is treated as a prefix rather
+ * than a URL to resolve against, so a deployment path such as
  * `https://gateway.example/openai/v1` keeps its segments instead of losing
  * them to `URL` resolution.
  */
-function listingUrl(baseURL: string): string {
-  return `${baseURL.replace(/\/+$/, '')}/models`
+function listingUrlCandidates(baseURL: string): string[] {
+  const base = baseURL.replace(/\/+$/, '')
+  if (/\/v\d+$/.test(base)) return [`${base}/models`]
+  return [`${base}/models`, `${base}/v1/models`]
 }
 
 /**
@@ -180,6 +197,11 @@ function usableProbeKey(raw: string): string {
   )
 }
 
+/** One candidate path's verdict, and whether the other path is worth asking. */
+type ProbeOutcome =
+  | { ok: true; models: readonly LlmDiscoveredModel[] }
+  | { ok: false; error: LlmError; retryable: boolean }
+
 /**
  * Interrogate one draft provider endpoint for the models it advertises.
  * @param request - the endpoint, protocol, and one-shot credential to use.
@@ -229,7 +251,6 @@ export async function discoverModels(
       'DISCOVERY_UNSUPPORTED',
     )
   }
-  const url = listingUrl(request.baseURL)
   // A key typed into the form wins: it is the one the user is testing, and it
   // may be the replacement for exactly the stored key that is failing. The
   // stored one is only asked for here, past the catalog short-circuit and the
@@ -239,46 +260,81 @@ export async function discoverModels(
   // relies on the provider's own ambient discovery is meant to be asked.
   const supplied = request.apiKey ?? await storedApiKey?.()
   const apiKey = supplied === undefined ? undefined : usableProbeKey(supplied)
-  let response: Response
-  try {
-    response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        accept: 'application/json',
-        ...apiKey === undefined ? {} : { authorization: `Bearer ${apiKey}` },
-        ...attributionHeaders(),
-      },
-      ...request.signal === undefined ? {} : { signal: request.signal },
-    })
-  } catch (error: unknown) {
-    if (request.signal?.aborted) {
-      throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
+  /** Ask one candidate path; a refusal that another path could answer better is retried by the caller. */
+  const probe = async (url: string): Promise<ProbeOutcome> => {
+    let response: Response
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          ...apiKey === undefined ? {} : { authorization: `Bearer ${apiKey}` },
+          ...attributionHeaders(),
+        },
+        ...request.signal === undefined ? {} : { signal: request.signal },
+      })
+    } catch (error: unknown) {
+      if (request.signal?.aborted) {
+        throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
+      }
+      // A connection fault indicts the host, not the path: the same host under
+      // another path cannot answer differently, so there is nothing to retry.
+      return { ok: false, retryable: false, error: new LlmError(`could not reach ${url}`, 'DISCOVERY_FAILED', { cause: error }) }
     }
-    throw new LlmError(`could not reach ${url}`, 'DISCOVERY_FAILED', { cause: error })
-  }
-  if (!response.ok) {
-    throw new LlmError(
-      `${url} answered ${response.status}${response.status === 401 || response.status === 403 ? '; check the API key' : ''}`,
-      'DISCOVERY_FAILED',
-    )
-  }
-  let text: string
-  try {
-    text = await readBounded(response, url)
-  } catch (error: unknown) {
-    // Cancellation during the body read rejects with the abort reason, which
-    // may be any value; the caller gets the same coded failure it would have
-    // for a cancellation before the request went out.
-    if (request.signal?.aborted) {
-      throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
+    if (!response.ok) {
+      // The refused body is never read; cancelling it frees the connection
+      // before the next candidate is asked.
+      await response.body?.cancel().catch(() => {
+        // Cancellation of an already-drained body is cleanup; the reply is decided either way.
+      })
+      return {
+        ok: false,
+        retryable: true,
+        error: new LlmError(
+          `${url} answered ${response.status}${response.status === 401 || response.status === 403 ? '; check the API key' : ''}`,
+          'DISCOVERY_FAILED',
+        ),
+      }
     }
-    throw error
+    let text: string
+    try {
+      text = await readBounded(response, url)
+    } catch (error: unknown) {
+      // Cancellation during the body read rejects with the abort reason, which
+      // may be any value; the caller gets the same coded failure it would have
+      // for a cancellation before the request went out.
+      if (request.signal?.aborted) {
+        throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
+      }
+      // An oversized reply is the endpoint answering, just too big — the other
+      // path cannot shrink it, so the failure is terminal.
+      if (error instanceof LlmError) return { ok: false, retryable: false, error }
+      throw error
+    }
+    let body: unknown
+    try {
+      body = JSON.parse(text)
+    } catch (error: unknown) {
+      // A gateway's bare path often answers its web console's HTML where the
+      // versioned path would answer the listing.
+      return { ok: false, retryable: true, error: new LlmError(`${url} did not answer with JSON`, 'DISCOVERY_FAILED', { cause: error }) }
+    }
+    try {
+      return { ok: true, models: readListing(body) }
+    } catch (error: unknown) {
+      // readListing's input comes from JSON.parse, which cannot carry throwing getters.
+      /* v8 ignore next -- readListing throws only LlmError, so this rethrow is unreachable. */
+      if (!(error instanceof LlmError)) throw error
+      return { ok: false, retryable: true, error }
+    }
   }
-  let body: unknown
-  try {
-    body = JSON.parse(text)
-  } catch (error: unknown) {
-    throw new LlmError(`${url} did not answer with JSON`, 'DISCOVERY_FAILED', { cause: error })
+  let failure: Extract<ProbeOutcome, { ok: false }> | undefined
+  for (const url of listingUrlCandidates(request.baseURL)) {
+    const outcome = await probe(url)
+    if (outcome.ok) return outcome.models
+    failure = outcome
+    if (!outcome.retryable) break
   }
-  return readListing(body)
+  /* v8 ignore next -- the candidate list is never empty, so the loop records a failure before it can fall through */
+  throw (failure as Extract<ProbeOutcome, { ok: false }>).error
 }
