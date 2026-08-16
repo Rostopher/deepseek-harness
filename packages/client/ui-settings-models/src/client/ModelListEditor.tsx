@@ -117,6 +117,52 @@ function IconTrash(): ReactNode {
 type CapacityField = 'contextWindow' | 'maxTokens'
 
 /**
+ * Every reasoning level a hand-declared model may offer, in escalation order —
+ * the same vocabulary llm-pi-ai's `THINKING_LEVEL_GATE` pins host-side. The
+ * wire spelling written here is the level's own name, which is what both
+ * protocol dispatches send; a gateway wanting a different spelling stays
+ * editable in settings.yaml, and such a key survives untouched until its chip
+ * is toggled off.
+ */
+const REASONING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+type ReasoningLevel = (typeof REASONING_LEVELS)[number]
+
+/** The row's declared modalities, or `undefined` when it inherits (absent or empty). */
+function inputOf(model: ModelDraft): readonly string[] | undefined {
+  const value = model['input']
+  if (!Array.isArray(value)) return undefined
+  const list = value.filter((item): item is string => typeof item === 'string')
+  return list.length === 0 ? undefined : list
+}
+
+/** The row's reasoning declaration: inherit, disabled, or the level dict. */
+function reasoningOf(model: ModelDraft): false | Record<string, string | null> | undefined {
+  const value = model['reasoningEfforts']
+  if (value === false) return false
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    return value as Record<string, string | null>
+  }
+  return undefined
+}
+
+/** The select's three expressible modality lists; anything else renders as a YAML-only value. */
+function inputChoiceOf(model: ModelDraft): string {
+  const list = inputOf(model)
+  if (list === undefined) return ''
+  if (list.length === 1 && list[0] === 'text') return 'text'
+  if (list.length === 2 && list.includes('text') && list.includes('image')) return 'text-image'
+  return 'yaml'
+}
+
+/** The reasoning select's state: inherit, disabled, or the level dict the chips edit. */
+function reasoningChoiceOf(model: ModelDraft): string {
+  const declared = reasoningOf(model)
+  if (declared === undefined) return ''
+  if (declared === false) return 'false'
+  return 'custom'
+}
+
+/**
  * What an empty capacity field is worth, shown as its placeholder so a row left
  * blank does not read as a model with no capacity at all.
  *
@@ -164,6 +210,10 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
   const [failure, setFailure] = useState<string | undefined>(undefined)
   const [candidates, setCandidates] = useState<readonly DiscoveredModelView[] | undefined>(undefined)
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set())
+  // The filter narrows the view without touching the pick set: a row scrolled
+  // out of sight — by the list's own scroll or by this filter — keeps its
+  // check, so narrowing and inverting compose instead of surprising.
+  const [query, setQuery] = useState('')
   // Rows carry an id and a name; capacities are the exception, so they stay
   // folded until asked for rather than crowding every row with four inputs.
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(new Set())
@@ -181,6 +231,37 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
   const editCapacity = (index: number, field: CapacityField, text: string): void => {
     setEditing(current => new Map(current).set(bufferKey(index, field), text))
     patch(index, { [field]: parseCapacity(text) })
+  }
+
+  /** Write the modality list a select choice names; the empty choice inherits (the key leaves the row). */
+  const chooseInput = (index: number, choice: string): void => {
+    patch(index, {
+      input: choice === 'text' ? ['text']
+        : choice === 'text-image' ? ['text', 'image']
+          : undefined,
+    })
+  }
+
+  /** Write the reasoning declaration a select choice names; the empty choice inherits. */
+  const chooseReasoning = (index: number, choice: string): void => {
+    if (choice === 'custom') {
+      // Seed the smallest useful declaration: off (send nothing) plus one real
+      // level. The chips refine it from here.
+      patch(index, { reasoningEfforts: { off: null, high: 'high' } })
+      return
+    }
+    patch(index, { reasoningEfforts: choice === 'false' ? false : undefined })
+  }
+
+  /** Toggle one level's membership in the row's dict; a key already present keeps its wire spelling. */
+  const toggleLevel = (index: number, level: ReasoningLevel): void => {
+    const row = models[index]
+    if (row === undefined) return
+    const current = reasoningOf(row)
+    if (current === undefined || current === false) return
+    const next = Object.fromEntries(Object.entries(current).filter(([key]) => key !== level))
+    if (!(level in current)) next[level] = level === 'off' ? null : level
+    patch(index, { reasoningEfforts: next })
   }
 
   /** What a capacity field shows: the buffer while typing, else the stored count. */
@@ -210,7 +291,7 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
     })
   }
 
-  const patch = (index: number, next: Record<string, string | number | undefined>): void => {
+  const patch = (index: number, next: Record<string, unknown>): void => {
     onChange(models.map((model, at) => {
       if (at !== index) return model
       // Rebuilt rather than spread over: an emptied optional field has to leave
@@ -252,6 +333,7 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
       const known = new Set(models.map(model => textOf(model, 'id')))
       setCandidates(found)
       setPicked(new Set(found.filter(model => !known.has(model.id)).map(model => model.id)))
+      setQuery('')
     } catch (error) {
       // The transport rejected rather than answering; without this the button
       // would stay busy with nothing shown.
@@ -264,6 +346,7 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
   const closePicker = (): void => {
     setCandidates(undefined)
     setPicked(new Set())
+    setQuery('')
   }
 
   const adoptPicked = (): void => {
@@ -299,6 +382,24 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
       return activeCandidates.every(candidate => current.has(candidate.id))
         ? new Set()
         : new Set(activeCandidates.map(candidate => candidate.id))
+    })
+  }
+
+  // Inversion covers the visible rows only: with a filter active, flipping
+  // rows the user cannot see would read as the button misbehaving.
+  const needle = query.trim().toLowerCase()
+  const visible = activeCandidates.filter(
+    candidate => needle === '' || candidate.id.toLowerCase().includes(needle),
+  )
+
+  /** Flip every visible candidate's membership in the pick set. */
+  const invertVisible = (): void => {
+    setPicked((current) => {
+      const next = new Set(current)
+      for (const candidate of visible) {
+        if (!next.delete(candidate.id)) next.add(candidate.id)
+      }
+      return next
     })
   }
 
@@ -429,6 +530,62 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
                     onChange={(event) => { editCapacity(index, 'maxTokens', event.target.value) }}
                   />
                 </label>
+                <label className={styles['modelField']}>
+                  <span className={styles['modelFieldLabel']}>{t('modelInput')}</span>
+                  <select
+                    className={`${styles['input']} ${styles['selectInput']}`}
+                    value={inputChoiceOf(model)}
+                    aria-label={`${t('modelInput')} ${index + 1}`}
+                    disabled={disabled}
+                    onChange={(event) => { chooseInput(index, event.target.value) }}
+                  >
+                    <option value="">{t('inputInherit')}</option>
+                    <option value="text">{t('inputText')}</option>
+                    <option value="text-image">{t('inputTextImage')}</option>
+                    {/* A list the select cannot spell (hand-written in
+                        settings.yaml) is named, not silently rounded to one. */}
+                    {inputChoiceOf(model) === 'yaml'
+                      ? <option value="yaml" disabled>{t('fieldCustomYaml')}</option>
+                      : null}
+                  </select>
+                </label>
+                <label className={styles['modelField']}>
+                  <span className={styles['modelFieldLabel']}>{t('modelReasoning')}</span>
+                  <select
+                    className={`${styles['input']} ${styles['selectInput']}`}
+                    value={reasoningChoiceOf(model)}
+                    aria-label={`${t('modelReasoning')} ${index + 1}`}
+                    disabled={disabled}
+                    onChange={(event) => { chooseReasoning(index, event.target.value) }}
+                  >
+                    <option value="">{t('reasoningInherit')}</option>
+                    <option value="false">{t('reasoningDisabled')}</option>
+                    <option value="custom">{t('reasoningCustom')}</option>
+                  </select>
+                </label>
+                {reasoningChoiceOf(model) === 'custom'
+                  ? (
+                    <div className={styles['levelChips']} role="group" aria-label={`${t('modelReasoningLevels')} ${index + 1}`}>
+                      {REASONING_LEVELS.map((level) => {
+                        const dict = reasoningOf(model)
+                        const on = dict !== undefined && dict !== false && level in dict
+                        return (
+                          <button
+                            key={level}
+                            type="button"
+                            className={on ? `${styles['levelChip']} ${styles['levelChipOn']}` : styles['levelChip']}
+                            aria-pressed={on}
+                            title={level === 'off' ? t('reasoningOffHint') : undefined}
+                            disabled={disabled}
+                            onClick={() => { toggleLevel(index, level) }}
+                          >
+                            {level}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )
+                  : null}
               </div>
             )
             : null}
@@ -457,28 +614,48 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
           </>
         )}
       >
-        <div className={styles['candidateActions']}>
+        <div className={styles['candidateToolbar']}>
           <Button variant="ghost" size="sm" onClick={toggleAllCandidates}>
             {t(allCandidatesPicked ? 'fetchDeselectAll' : 'fetchSelectAll')}
           </Button>
+          <input
+            className={`${styles['input']} ${styles['candidateSearch']}`}
+            type="search"
+            value={query}
+            placeholder={t('fetchSearch')}
+            aria-label={t('fetchSearch')}
+            onChange={(event) => { setQuery(event.target.value) }}
+          />
+          <button
+            type="button"
+            className={styles['linkButton']}
+            disabled={visible.length === 0}
+            onClick={invertVisible}
+          >
+            {t('fetchInvert')}
+          </button>
         </div>
-        <ul className={styles['candidateList']}>
-          {(candidates ?? []).map(candidate => (
-            <li key={candidate.id} className={styles['candidate']}>
-              <label className={styles['candidateLabel']}>
-                <input
-                  type="checkbox"
-                  checked={picked.has(candidate.id)}
-                  onChange={() => { toggle(candidate.id) }}
-                />
-                {/* The id alone: it is the string adoption writes, and the
-                    capacities the endpoint reported are adopted with it and
-                    editable in the row that appears. */}
-                <span className={styles['candidateId']}>{candidate.id}</span>
-              </label>
-            </li>
-          ))}
-        </ul>
+        {visible.length === 0
+          ? <p className={styles['candidateNoMatch']}>{t('fetchNoMatch')}</p>
+          : (
+            <ul className={styles['candidateList']}>
+              {visible.map(candidate => (
+                <li key={candidate.id} className={styles['candidate']}>
+                  <label className={styles['candidateLabel']}>
+                    <input
+                      type="checkbox"
+                      checked={picked.has(candidate.id)}
+                      onChange={() => { toggle(candidate.id) }}
+                    />
+                    {/* The id alone: it is the string adoption writes, and the
+                        capacities the endpoint reported are adopted with it and
+                        editable in the row that appears. */}
+                    <span className={styles['candidateId']}>{candidate.id}</span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+          )}
       </Modal>
     </section>
   )

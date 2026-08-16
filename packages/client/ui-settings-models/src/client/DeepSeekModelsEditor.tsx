@@ -74,7 +74,7 @@ export interface DeepSeekModelsValidationFailure {
   index: number
   /** Message key owned by the Models settings section. */
   key: 'modelIdRequired' | 'modelIdDuplicate' | 'modelNameInvalid' | 'modelContextInvalid'
-  | 'modelMaxTokensInvalid'
+  | 'modelMaxTokensInvalid' | 'modelReasoningEmpty'
 }
 
 /** Convert a schema-validated catalog value into records without dropping hidden fields. */
@@ -117,6 +117,17 @@ export function validateDeepSeekModels(value: unknown): DeepSeekModelsValidation
     if (maxTokens !== undefined
       && (typeof maxTokens !== 'number' || !Number.isInteger(maxTokens) || maxTokens <= 0)) {
       return { index, key: 'modelMaxTokensInvalid' }
+    }
+    // Mirrors the host resolver: a declared level dict must offer at least one
+    // level beyond `off` — an empty dict (or a valueless YAML key, which
+    // arrives as null) is neither "inherit" nor "disable" and would fail
+    // resolution when the route is read.
+    const reasoningEfforts = model['reasoningEfforts']
+    if (reasoningEfforts !== undefined && reasoningEfforts !== false) {
+      const levels = typeof reasoningEfforts === 'object' && reasoningEfforts !== null
+        ? Object.keys(reasoningEfforts).filter(level => level !== 'off')
+        : []
+      if (levels.length === 0) return { index, key: 'modelReasoningEmpty' }
     }
   }
   return undefined

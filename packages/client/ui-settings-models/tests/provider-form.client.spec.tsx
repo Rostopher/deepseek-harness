@@ -628,6 +628,51 @@ describe('endpoint interrogation', () => {
     expect(boxes.map(box => box.checked)).toEqual([true, true, true])
     expect(within_(dialog, en.fetchDeselectAll)).toBeTruthy()
   })
+
+  it('filters candidates and inverts the visible selection only', async () => {
+    const discover = vi.fn(() => Promise.resolve(ok({
+      models: [{ id: 'alpha' }, { id: 'alpine' }, { id: 'beta' }],
+    })))
+    const { mutate } = await mountSection({ discover })
+    openEditor('openai')
+
+    fireEvent.click(screen.getByText(en.fetchModels))
+    await screen.findByText(en.fetchTitle)
+
+    // Narrowing to "alp" hides beta from the list; its check survives out of
+    // sight, and the invert reaches only the two rows still shown.
+    fireEvent.change(screen.getByLabelText(en.fetchSearch), { target: { value: 'alp' } })
+    expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(2)
+    fireEvent.click(buttonNamed(en.fetchInvert))
+    const boxes = [...document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+    expect(boxes.map(box => box.checked)).toEqual([false, false])
+
+    fireEvent.click(screen.getByText(en.fetchAdopt))
+    fireEvent.click(screen.getByText(en.apply))
+
+    await waitFor(() => { expect(mutate).toHaveBeenCalled() })
+    expect(firstMutate(mutate).ops[0]?.value).toEqual([{ id: 'beta' }])
+  })
+
+  it('says so when the filter matches nothing, and a fresh fetch clears it', async () => {
+    const discover = vi.fn(() => Promise.resolve(ok({ models: [{ id: 'alpha' }] })))
+    await mountSection({ discover })
+    openEditor('openai')
+
+    fireEvent.click(screen.getByText(en.fetchModels))
+    await screen.findByText(en.fetchTitle)
+    fireEvent.change(screen.getByLabelText(en.fetchSearch), { target: { value: 'zzz' } })
+
+    await screen.findByText(en.fetchNoMatch)
+    expect(buttonNamed(en.fetchInvert).disabled).toBe(true)
+
+    // Closing and re-asking restarts the pick pass, filter included.
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within_(dialog, en.cancel))
+    fireEvent.click(screen.getByText(en.fetchModels))
+    await screen.findByText(en.fetchTitle)
+    expect(screen.getByLabelText<HTMLInputElement>(en.fetchSearch).value).toBe('')
+  })
 })
 
 describe('provider rows', () => {
@@ -1038,6 +1083,68 @@ describe('hand-declared providers', () => {
     fireEvent.change(screen.getByLabelText(`${en.modelContextWindow} 1`), { target: { value: '64 KiB' } })
 
     expect(screen.getByText(`${en.model} 1: ${en.modelContextInvalid}`)).toBeTruthy()
+    expect(buttonNamed(en.create).disabled).toBe(true)
+  })
+
+  it('declares modalities and reasoning levels from the row’s fold', async () => {
+    const { mutate, onClose } = mountCard()
+    fireEvent.change(screen.getByLabelText(en.customRoute), { target: { value: 'acme' } })
+    fireEvent.change(screen.getByLabelText(en.baseUrl), { target: { value: 'https://acme.test/v1' } })
+    fireEvent.click(screen.getByRole('button', { name: en.addModel }))
+    fireEvent.change(screen.getByLabelText(`${en.modelId} 1`), { target: { value: 'k3' } })
+    expandModel(1)
+
+    fireEvent.change(screen.getByLabelText(`${en.modelInput} 1`), { target: { value: 'text-image' } })
+    fireEvent.change(screen.getByLabelText(`${en.modelReasoning} 1`), { target: { value: 'custom' } })
+    // The seed offers off + high; the chips extend it — here, k3's headline level.
+    fireEvent.click(screen.getByRole('button', { name: 'max' }))
+    fireEvent.click(screen.getByText(en.create))
+
+    await waitFor(() => { expect(onClose).toHaveBeenCalledWith(true) })
+    expect(firstMutate(mutate).ops[0]?.value).toMatchObject({
+      models: [{
+        id: 'k3',
+        input: ['text', 'image'],
+        reasoningEfforts: { off: null, high: 'high', max: 'max' },
+      }],
+    })
+  })
+
+  it('clears the declaration when a select returns to inherit', async () => {
+    const { mutate, onClose } = mountCard()
+    fireEvent.change(screen.getByLabelText(en.customRoute), { target: { value: 'acme' } })
+    fireEvent.change(screen.getByLabelText(en.baseUrl), { target: { value: 'https://acme.test/v1' } })
+    fireEvent.click(screen.getByRole('button', { name: en.addModel }))
+    fireEvent.change(screen.getByLabelText(`${en.modelId} 1`), { target: { value: 'k3' } })
+    expandModel(1)
+
+    fireEvent.change(screen.getByLabelText(`${en.modelInput} 1`), { target: { value: 'text-image' } })
+    fireEvent.change(screen.getByLabelText(`${en.modelInput} 1`), { target: { value: '' } })
+    fireEvent.change(screen.getByLabelText(`${en.modelReasoning} 1`), { target: { value: 'custom' } })
+    fireEvent.change(screen.getByLabelText(`${en.modelReasoning} 1`), { target: { value: '' } })
+    fireEvent.click(screen.getByText(en.create))
+
+    await waitFor(() => { expect(onClose).toHaveBeenCalledWith(true) })
+    // Inherit means the key leaves the row rather than being stored empty.
+    const written = firstMutate(mutate).ops[0]?.value as { models: Record<string, unknown>[] }
+    expect(written.models[0]).not.toHaveProperty('input')
+    expect(written.models[0]).not.toHaveProperty('reasoningEfforts')
+  })
+
+  it('refuses a reasoning declaration with no level beyond off', () => {
+    mountCard()
+    fireEvent.change(screen.getByLabelText(en.customRoute), { target: { value: 'acme' } })
+    fireEvent.change(screen.getByLabelText(en.baseUrl), { target: { value: 'https://acme.test/v1' } })
+    fireEvent.click(screen.getByRole('button', { name: en.addModel }))
+    fireEvent.change(screen.getByLabelText(`${en.modelId} 1`), { target: { value: 'k3' } })
+    expandModel(1)
+
+    fireEvent.change(screen.getByLabelText(`${en.modelReasoning} 1`), { target: { value: 'custom' } })
+    // Toggling the last real level off leaves a dict that is neither inherit
+    // nor disable — the host resolver would reject it at read time.
+    fireEvent.click(screen.getByRole('button', { name: 'high' }))
+
+    expect(screen.getByText(`${en.model} 1: ${en.modelReasoningEmpty}`)).toBeTruthy()
     expect(buttonNamed(en.create).disabled).toBe(true)
   })
 

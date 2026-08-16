@@ -518,6 +518,43 @@
   line-height: 18px;
 }
 
+/* The reasoning-level chips span the fold's full width under the field grid. */
+.levelChips {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.levelChip {
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 22px;
+  cursor: pointer;
+}
+
+.levelChip:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.levelChipOn {
+  border-color: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-label-primary);
+}
+
+.levelChip:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .modelEmpty {
   padding: 12px;
   border: 1px dashed var(--dsw-alias-border-l3);
@@ -678,4 +715,28 @@ select.input {
   font-family: var(--ds-font-family-code);
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+
+.candidateToolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+/* The shared .input is width:100%; as a flex child it also needs to be
+   allowed to shrink below its content width so the invert button keeps its
+   place beside it. */
+.candidateSearch {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+}
+
+.candidateNoMatch {
+  margin: 0;
+  padding: 12px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+  text-align: center;
 }
